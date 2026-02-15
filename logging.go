@@ -320,9 +320,6 @@ func resolveCaller() string {
 
 		// 找到外部调用点
 		return fmt.Sprintf("%s:%d", filepath.Base(f.File), f.Line)
-
-		// not reached
-		// if !more { break }
 	}
 	return "???:0"
 }
@@ -476,11 +473,80 @@ func buildJSONEntry(lv Level, caller string, args ...any) orderedEntry {
 	}
 }
 
-// ----------------- TEXT 输出 -----------------
+// ----------------- TEXT 输出（字段顺序按传参顺序） -----------------
+
+type kvPair struct {
+	k string
+	v any
+}
+
+// parseArgsTextOrdered: 专用于 TEXT 输出，保持 key/value 的传参顺序
+func parseArgsTextOrdered(args []any) (msg any, fields []kvPair, dataJSON []string, errField error, extra []any) {
+	fields = make([]kvPair, 0, 8)
+
+	if len(args) == 0 {
+		return "", fields, nil, nil, nil
+	}
+
+	msg = args[0]
+	rest := args[1:]
+
+	// msg 后直接给 map：map 天生无序，这里用排序保证稳定（但不是“传参顺序”）
+	if len(rest) == 1 {
+		if m, ok := rest[0].(map[string]any); ok {
+			keys := make([]string, 0, len(m))
+			for k := range m {
+				keys = append(keys, normalizeKey(k))
+			}
+			sort.Strings(keys)
+			for _, k := range keys {
+				fields = append(fields, kvPair{k: k, v: m[k]})
+			}
+			return msg, fields, nil, nil, nil
+		}
+	}
+
+	// 先把“无 key 的 JSON 字符串”吸到 data（保持原始字符串）
+	var kv []any
+	for _, v := range rest {
+		if s, ok := v.(string); ok {
+			ss := strings.TrimSpace(s)
+			if json.Valid([]byte(ss)) {
+				dataJSON = append(dataJSON, ss)
+				continue
+			}
+		}
+		kv = append(kv, v)
+	}
+
+	// 再处理 trailing error（修复：error 后面跟着 json data 时，err 也能识别）
+	if len(kv) > 0 {
+		if e, ok := kv[len(kv)-1].(error); ok && len(kv)%2 == 1 {
+			errField = e
+			kv = kv[:len(kv)-1]
+		}
+	}
+
+	// 解析 key/value（保持传参顺序）
+	for i := 0; i+1 < len(kv); i += 2 {
+		key, ok := kv[i].(string)
+		if !ok {
+			extra = append(extra, kv[i], kv[i+1])
+			continue
+		}
+		fields = append(fields, kvPair{k: normalizeKey(key), v: kv[i+1]})
+	}
+
+	if len(kv)%2 == 1 {
+		extra = append(extra, kv[len(kv)-1])
+	}
+
+	return msg, fields, dataJSON, errField, extra
+}
 
 func buildTextLine(lv Level, caller string, args ...any) string {
 	ts := time.Now().Format("2006-01-02 15:04:05")
-	msg, fields, data, errField, extra := parseArgs(args)
+	msg, fields, data, errField, extra := parseArgsTextOrdered(args)
 
 	var b strings.Builder
 	b.WriteString(ts)
@@ -491,11 +557,12 @@ func buildTextLine(lv Level, caller string, args ...any) string {
 	b.WriteString(" ")
 	b.WriteString(fmt.Sprint(msg))
 
-	for k, v := range fields {
+	// ✅ fields 按传参顺序输出
+	for _, kv := range fields {
 		b.WriteString(" ")
-		b.WriteString(k)
+		b.WriteString(kv.k)
 		b.WriteString("=")
-		b.WriteString(formatTextValue(v))
+		b.WriteString(formatTextValue(kv.v))
 	}
 
 	if errField != nil {
